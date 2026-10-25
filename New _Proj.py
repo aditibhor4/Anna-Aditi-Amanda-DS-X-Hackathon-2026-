@@ -177,6 +177,22 @@ def formula_risk(ingredients):
             "advice": "Little or no water, so microbes struggle to grow. Test if it's past its toss-by date."}
 
 
+def guess_base(ingredients):
+    """Infer a product's base (water / oil / powder) from its ingredient list.
+
+    Used when the user adds their own product, since other pages rely on PRODUCTS[id]["base"].
+    Water-first formulas are "water"; talc/mica/starch-led formulas are "powder"; otherwise "oil".
+    """
+    text = str(ingredients or "").lower()
+    if is_water_based(ingredients):
+        return "water"
+    if re.search(r"\btalc\b|\bmica\b|silica|starch|kaolin|\bstearate\b", text):
+        return "powder"
+    if re.search(r"\boil\b|\bhuile\b|butter|cera\b|wax|cire\b|glyceride|caprylic/capric", text):
+        return "oil"
+    return "water"   # safest default: assume microbes can grow unless we see a clear oil/powder base
+
+
 def toss_by(opened, months):
     d = datetime.strptime(opened, "%Y-%m-%d").date()
     m = d.month - 1 + months
@@ -632,6 +648,7 @@ from collections import Counter
 INGREDIENT_HEADERS = r"([il1|]ngr[eéè3]d[il1]ents?|inci|composition|zutaten|ingredientes)\s*[:：.\-]?"
 STOP_WORDS = r"(made in|fabriqu[ée]|produit en|manufactured|distributed|lot\b|batch|exp\b|exp\.|expiry|best before|" \
              r"[àa] utiliser|ddm|warning|caution|pr[ée]cautions?|directions|mode d'emploi|usage|net\b|contenance|" \
+             r"period after opening|periode? apr[èe]s ouverture|p[ée]riode d'ouverture|use within|" \
              r"\b\d+(?:[.,]\d+)?\s?(?:ml|g|fl\.?\s?oz)\b|\b\d{8,13}\b|\bpao\b|\b\d{1,2}\s?m\b)"
 VALID_PAO = {1, 3, 6, 9, 12, 18, 24, 30, 36}
 
@@ -757,9 +774,14 @@ def parse_label(text, vocab=None):
     m = re.search(r"\b(?:lot|batch|l/n)\s*(?:no\.?|n°|#)?\s*[:.]?\s*([A-Z0-9][A-Z0-9\-]{2,})", flat, flags=re.I)
     if m:
         out["batch"] = m.group(1).upper()
-    m = re.search(r"(?<!\d)(\d{13}|\d{12}|\d{8})(?!\d)", flat.replace(" ", ""))
-    if m:
-        out["barcode"] = m.group(1)
+    # Barcodes: try the spaced text first (word boundaries keep EAN/UPC lengths intact,
+    # so a 13-digit code next to a size like "50 ml" is not mis-joined), then fall back
+    # to the de-spaced text for codes OCR split into groups (e.g. "360052 335 1251").
+    bm = re.search(r"(?<!\d)(\d{13}|\d{12}|\d{8})(?!\d)", flat)
+    if not bm:
+        bm = re.search(r"(?<!\d)(\d{13}|\d{12}|\d{8})(?!\d)", flat.replace(" ", ""))
+    if bm:
+        out["barcode"] = bm.group(1)
     m = re.search(r"(\d+(?:[.,]\d+)?)\s?(ml|mL|g|fl\.?\s?oz)\b", flat)
     if m:
         out["size"] = f"{m.group(1)} {m.group(2)}"
@@ -978,6 +1000,29 @@ def simulated(note="Simulated for demo. Test thresholds are placeholders pending
 
 if "shelf" not in st.session_state:
     st.session_state.shelf = [dict(item) for item in SHELF]
+
+# Products the user adds (from a label photo, an Open Beauty Facts search, or manual entry)
+# live here across reruns. Streamlit re-executes this module on every rerun, which resets the
+# module-level PRODUCTS back to the 20 demo items, so we re-register the user's products into
+# PRODUCTS each run. Every page that reads PRODUCTS[id] then sees them with no other changes.
+if "user_products" not in st.session_state:
+    st.session_state.user_products = {}   # id -> product dict (same shape as PRODUCTS values)
+if "next_user_pid" not in st.session_state:
+    st.session_state.next_user_pid = 1
+PRODUCTS.update(st.session_state.user_products)
+
+
+def add_user_product(name, category, base, packaging, pao, eye, opened, ingredients=""):
+    """Register a new product and put it on the shelf. Returns the new product id."""
+    pid = f"u{st.session_state.next_user_pid:02d}"
+    st.session_state.next_user_pid += 1
+    product = {"name": name, "category": category or "other", "base": base,
+               "packaging": packaging if packaging != "unknown" else "jar",
+               "pao": pao or 12, "eye": bool(eye), "ingredients": ingredients, "user_added": True}
+    st.session_state.user_products[pid] = product
+    PRODUCTS[pid] = product
+    st.session_state.shelf.append({"id": pid, "opened": str(opened), "test": None})
+    return pid
 
 dataset_path = find_dataset()
 obf = load_obf(dataset_path) if dataset_path else None
@@ -1289,12 +1334,35 @@ elif page == "Test a product":
             for n, step in enumerate(guide["steps"], 1):
                 st.markdown(f"**{n}.** {step}")
 
-        if prod.get("shelf_id") and st.button("Save this result to My shelf", type="primary"):
-            key = classify(signal) if signal is not None else "unreadable"
-            for item in st.session_state.shelf:
-                if item["id"] == prod["shelf_id"]:
-                    item["test"] = {"date": str(TODAY), "result": key, "signal": signal, "reason": r["reason"]}
-            st.success(f"Saved to {name}.")
+        test_record = {"date": str(TODAY), "result": classify(signal) if signal is not None else "unreadable",
+                       "signal": signal, "reason": r["reason"]}
+        st.markdown("#### Save to My shelf")
+        if prod.get("shelf_id"):
+            # Product already on the shelf: just update its latest result.
+            if st.button("Save this result to My shelf", type="primary"):
+                for item in st.session_state.shelf:
+                    if item["id"] == prod["shelf_id"]:
+                        item["test"] = test_record
+                st.success(f"Saved to {name}.")
+        else:
+            # New product (from a label photo, an OBF search, or manual entry): add it to the shelf.
+            matched = source == "Search Open Beauty Facts" or (source == "Label photo" and prod.get("name"))
+            st.caption(
+                "This product isn't on your shelf yet. "
+                + ("It matched Open Beauty Facts, " if matched else "")
+                + "add it to keep its details, toss-by date and this result."
+            )
+            base = guess_base(ingredients)
+            cat = prod.get("type") or "other"
+            if st.button("＋ Add to My shelf with this result", type="primary", key="add_new_to_shelf"):
+                pid = add_user_product(name=name, category=cat, base=base, packaging=packaging,
+                                       pao=pao, eye=eye, opened=opened, ingredients=ingredients)
+                for item in st.session_state.shelf:
+                    if item["id"] == pid:
+                        item["test"] = test_record
+                st.success(f"Added **{name}** to My shelf (saved as {base}-based, "
+                           f"{PRODUCTS[pid]['pao']}M) with this result.")
+                st.caption("Open the My shelf page to see it with its toss-by date and reminders.")
     simulated("Simulated test strip. Score weights and thresholds are placeholders pending lab calibration.")
 
 # ---------------- Scan ----------------
@@ -1407,13 +1475,6 @@ elif page == "My shelf":
                            + (f" · {t['reason']}" if t.get("reason") else ""))
             else:
                 c3.markdown(badge("Not tested yet", "gray"), unsafe_allow_html=True)
-            with st.expander("Explain with AI"):
-                st.caption(AI_DISCLAIMER)
-                for line in explain_result(item["id"], t):
-                    st.markdown(line)
-                st.markdown("---")
-                for line in explain_toss_by(item["id"], item["opened"]):
-                    st.markdown(line)
 
     st.divider()
     st.subheader("Care reminders")
