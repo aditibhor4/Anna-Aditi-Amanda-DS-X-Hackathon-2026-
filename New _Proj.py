@@ -162,11 +162,17 @@ def is_water_based(ingredients):
     return any(re.search(r"aqua|water|\beau\b", p) for p in parts[:2])
 
 
-def formula_risk(ingredients):
-    """How risky a formula is and how often to test it."""
-    if not str(ingredients or "").strip():
+def formula_risk(ingredients, base_override=None):
+    """How risky a formula is and how often to test it.
+
+    base_override (optional "water"/"oil"/"powder") lets the user's chosen formula base decide whether
+    the product is treated as water-based, instead of only guessing from the ingredient text.
+    """
+    has_text = bool(str(ingredients or "").strip())
+    if not has_text and base_override is None:
         return {"level": "unknown", "water": False, "found": [], "days": None, "advice": "Paste an ingredient list to check it."}
-    found, water = preservatives_found(ingredients), is_water_based(ingredients)
+    found = preservatives_found(ingredients)
+    water = (base_override == "water") if base_override else is_water_based(ingredients)
     if water and not found:
         return {"level": "higher", "water": True, "found": [], "days": 14,
                 "advice": "Water-based with no recognized preservative. Test every 2 weeks once opened, and keep it out of the bathroom."}
@@ -831,9 +837,9 @@ def months_between(start, end):
     return max(0.0, (end - start).days / 30.44)
 
 
-def risk_factors(ingredients, packaging, opened, pao, storage, eye):
+def risk_factors(ingredients, packaging, opened, pao, storage, eye, base=None):
     """Each factor gives points; the total (max 100) is how much the product's situation favors microbial growth."""
-    fr = formula_risk(ingredients)
+    fr = formula_risk(ingredients, base_override=base)
     months = months_between(opened, TODAY)
     if pao:
         age_pts = 25 if months > pao else round(20 * months / pao)
@@ -998,17 +1004,53 @@ def simulated(note="Simulated for demo. Test thresholds are placeholders pending
     st.caption("⚠️ " + note)
 
 
-if "shelf" not in st.session_state:
-    st.session_state.shelf = [dict(item) for item in SHELF]
+# ---------------------------------------------------------------------------
+# Persistence: the shelf and user-added products survive a page refresh / restart.
+# We keep ONLY user data (shelf, user products, id counter) in a small JSON file
+# next to this script. The dataset, demo catalog and FDA data stay in code.
+# ---------------------------------------------------------------------------
+PERSIST_PATH = os.path.join(HERE, "teria_shelf.json")
 
-# Products the user adds (from a label photo, an Open Beauty Facts search, or manual entry)
-# live here across reruns. Streamlit re-executes this module on every rerun, which resets the
-# module-level PRODUCTS back to the 20 demo items, so we re-register the user's products into
-# PRODUCTS each run. Every page that reads PRODUCTS[id] then sees them with no other changes.
-if "user_products" not in st.session_state:
-    st.session_state.user_products = {}   # id -> product dict (same shape as PRODUCTS values)
-if "next_user_pid" not in st.session_state:
-    st.session_state.next_user_pid = 1
+
+def load_state():
+    """Read saved shelf/products from disk. On first run or any error, fall back to the demo shelf."""
+    default = {"shelf": [dict(item) for item in SHELF], "user_products": {}, "next_user_pid": 1}
+    if not os.path.exists(PERSIST_PATH):
+        return default
+    try:
+        import json
+        with open(PERSIST_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        # Basic shape check so a corrupt file can't break startup.
+        if not isinstance(data.get("shelf"), list) or not isinstance(data.get("user_products"), dict):
+            return default
+        data.setdefault("next_user_pid", 1)
+        return data
+    except Exception:
+        return default
+
+
+def save_state():
+    """Write the current shelf/products to disk. Called after any change."""
+    try:
+        import json
+        with open(PERSIST_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"shelf": st.session_state.shelf,
+                       "user_products": st.session_state.user_products,
+                       "next_user_pid": st.session_state.next_user_pid}, fh, indent=2)
+    except Exception as exc:   # never let a disk issue crash the app; just warn once
+        st.warning(f"Could not save your shelf to disk: {exc}")
+
+
+if "shelf" not in st.session_state:
+    _saved = load_state()
+    st.session_state.shelf = _saved["shelf"]
+    # Products the user adds (from a label photo, an Open Beauty Facts search, or manual entry)
+    # live here across reruns. Streamlit re-executes this module on every rerun, which resets the
+    # module-level PRODUCTS back to the 20 demo items, so we re-register the user's products into
+    # PRODUCTS each run. Every page that reads PRODUCTS[id] then sees them with no other changes.
+    st.session_state.user_products = _saved["user_products"]
+    st.session_state.next_user_pid = _saved["next_user_pid"]
 PRODUCTS.update(st.session_state.user_products)
 
 
@@ -1022,7 +1064,25 @@ def add_user_product(name, category, base, packaging, pao, eye, opened, ingredie
     st.session_state.user_products[pid] = product
     PRODUCTS[pid] = product
     st.session_state.shelf.append({"id": pid, "opened": str(opened), "test": None})
+    save_state()
     return pid
+
+
+def remove_from_shelf(shelf_id):
+    """Remove a product from the shelf. User-added products are also forgotten entirely."""
+    st.session_state.shelf = [i for i in st.session_state.shelf if i["id"] != shelf_id]
+    if shelf_id in st.session_state.user_products:
+        del st.session_state.user_products[shelf_id]
+        PRODUCTS.pop(shelf_id, None)
+    save_state()
+
+
+def update_opened(shelf_id, new_opened):
+    """Change a product's opening date (recomputes its toss-by date)."""
+    for item in st.session_state.shelf:
+        if item["id"] == shelf_id:
+            item["opened"] = str(new_opened)
+    save_state()
 
 dataset_path = find_dataset()
 obf = load_obf(dataset_path) if dataset_path else None
@@ -1253,10 +1313,15 @@ elif page == "Test a product":
                 st.caption("No matches. Try 'crème', 'shampooing' or a brand.")
 
     elif source == "My shelf":
-        pid = st.selectbox("Product", [i["id"] for i in st.session_state.shelf], format_func=lambda i: PRODUCTS[i]["name"])
+        shelf_ids = [i["id"] for i in st.session_state.shelf]
+        if not shelf_ids:
+            st.info("Your shelf is empty. Add a product using one of the other options above.")
+            st.stop()
+        pid = st.selectbox("Product", shelf_ids, format_func=lambda i: PRODUCTS[i]["name"])
         p = PRODUCTS[pid]
         item = next(i for i in st.session_state.shelf if i["id"] == pid)
         prod.update(name=p["name"], type=p["category"], packaging=p["packaging"], pao=p["pao"], eye=p["eye"],
+                    base=p["base"],
                     ingredients={"water": "Aqua, Glycerin, Phenoxyethanol", "oil": "Ricinus Communis Oil, Cera Alba",
                                  "powder": "Talc, Mica, Zinc Stearate"}[p["base"]], shelf_id=pid,
                     opened=datetime.strptime(item["opened"], "%Y-%m-%d").date())
@@ -1281,6 +1346,19 @@ elif page == "Test a product":
     eye = c2.checkbox("Used near the eyes", eye_default, key=f"eye_{source}")
     ingredients = st.text_area("Ingredients", prod["ingredients"] or "", height=90, key=f"ing_{source}_{name}")
 
+    # Base (water / oil / powder) drives the formula risk score and how other pages describe the product.
+    # Pre-fill from the product's known base (My shelf) or infer it from the ingredients, but let the user correct it.
+    base_opts = ["water", "oil", "powder"]
+    base_default = prod.get("base") or guess_base(ingredients)
+    base = c1.selectbox("Formula base", base_opts,
+                        index=base_opts.index(base_default) if base_default in base_opts else 0,
+                        format_func=lambda b: {"water": "Water-based (aqua first)",
+                                               "oil": "Oil-based (oils, butters, waxes)",
+                                               "powder": "Powder (talc, mica, pressed)"}[b],
+                        key=f"base_{source}",
+                        help="Microbes need water, so water-based products are the highest risk. "
+                             "We pre-filled a guess from the ingredients; change it if it's wrong.")
+
     # ---- Step 3: run the test ----
     st.subheader("Step 3 — run the test")
     light = st.radio("Lighting when the photo is taken", list(LIGHTS), horizontal=True,
@@ -1293,7 +1371,7 @@ elif page == "Test a product":
     if not name.strip():
         st.info("Add a product name to run the test.")
     else:
-        factors, factor_score, fr = risk_factors(ingredients, packaging, opened, pao, storage, eye)
+        factors, factor_score, fr = risk_factors(ingredients, packaging, opened, pao, storage, eye, base=base)
         seed = zlib.crc32(f"{name}|{opened}|{packaging}|{storage}".encode()) % 10000 + st.session_state.strip_seed
         strip = label_card(simulate_strip(factor_score, light, seed), name)
         r = read_strip(strip)
@@ -1304,10 +1382,18 @@ elif page == "Test a product":
         left, right = st.columns([3, 2])
         left.image(strip, caption=f"Simulated Teria strip for {name} ({light.lower()})")
         with right:
-            st.markdown("**Teria score**")
+            st.markdown(
+                "<div style='display:flex;align-items:center;gap:0.5rem;margin-bottom:0.2rem'>"
+                "<span style='font-weight:600'>Teria score</span>"
+                "<span style='background:#F2E4C9;color:#7a5a00;border:1px solid #e3cf9f;"
+                "padding:2px 9px;border-radius:12px;font-size:0.72rem;font-weight:700;"
+                "letter-spacing:0.06em'>⚠ SIMULATED DEMO</span></div>",
+                unsafe_allow_html=True)
             st.markdown(f"<div style='font-size:3.2rem;font-weight:700;line-height:1'>{score}"
                         f"<span style='font-size:1.2rem;color:#7b8682'> / 100</span></div>", unsafe_allow_html=True)
             st.markdown(badge(band, color), unsafe_allow_html=True)
+            st.caption("Not a real contamination measurement or safety verdict. "
+                       "The strip is generated from risk factors; thresholds await lab calibration.")
             st.write(advice)
             st.progress(score / 100)
             st.caption("Higher = more concern. 60% strip reading + 40% risk factors.")
@@ -1343,6 +1429,7 @@ elif page == "Test a product":
                 for item in st.session_state.shelf:
                     if item["id"] == prod["shelf_id"]:
                         item["test"] = test_record
+                save_state()
                 st.success(f"Saved to {name}.")
         else:
             # New product (from a label photo, an OBF search, or manual entry): add it to the shelf.
@@ -1352,7 +1439,6 @@ elif page == "Test a product":
                 + ("It matched Open Beauty Facts, " if matched else "")
                 + "add it to keep its details, toss-by date and this result."
             )
-            base = guess_base(ingredients)
             cat = prod.get("type") or "other"
             if st.button("＋ Add to My shelf with this result", type="primary", key="add_new_to_shelf"):
                 pid = add_user_product(name=name, category=cat, base=base, packaging=packaging,
@@ -1360,6 +1446,7 @@ elif page == "Test a product":
                 for item in st.session_state.shelf:
                     if item["id"] == pid:
                         item["test"] = test_record
+                save_state()
                 st.success(f"Added **{name}** to My shelf (saved as {base}-based, "
                            f"{PRODUCTS[pid]['pao']}M) with this result.")
                 st.caption("Open the My shelf page to see it with its toss-by date and reminders.")
@@ -1371,6 +1458,9 @@ elif page == "Scan":
     st.write("Guided testing in three steps: pick your product, follow the sampling walkthrough for its "
              "packaging, then photograph the whole card.")
     shelf_ids = [i["id"] for i in st.session_state.shelf]
+    if not shelf_ids:
+        st.info("Your shelf is empty. Add a product on the **Test a product** page first.")
+        st.stop()
     pid = st.selectbox("Step 1 — which product are you testing?", shelf_ids,
                        format_func=lambda i: PRODUCTS[i]["name"])
 
@@ -1429,6 +1519,7 @@ elif page == "Scan":
             for item in st.session_state.shelf:
                 if item["id"] == pid:
                     item["test"] = fresh_test
+            save_state()
             right.success(f"Saved to {PRODUCTS[pid]['name']}.")
 
     st.divider()
@@ -1475,6 +1566,22 @@ elif page == "My shelf":
                            + (f" · {t['reason']}" if t.get("reason") else ""))
             else:
                 c3.markdown(badge("Not tested yet", "gray"), unsafe_allow_html=True)
+
+            with st.expander("Manage this product"):
+                m1, m2 = st.columns([3, 1], vertical_alignment="bottom")
+                new_opened = m1.date_input("Date opened", datetime.strptime(item["opened"], "%Y-%m-%d").date(),
+                                           max_value=TODAY, key=f"opened_edit_{item['id']}")
+                if str(new_opened) != item["opened"]:
+                    update_opened(item["id"], new_opened)
+                    st.rerun()
+                m2.button("Remove", key=f"remove_{item['id']}", on_click=remove_from_shelf, args=(item["id"],))
+                if item["id"] in st.session_state.user_products:
+                    st.caption("You added this product, so removing it deletes it completely.")
+                else:
+                    st.caption("This is a demo product. Removing it takes it off your shelf for this session.")
+
+    if not st.session_state.shelf:
+        st.info("Your shelf is empty. Add a product from the **Test a product** page.")
 
     st.divider()
     st.subheader("Care reminders")
@@ -1551,14 +1658,17 @@ elif page == "Ask AI":
 
     if topic == "A product on my shelf":
         ids = [i["id"] for i in st.session_state.shelf]
-        pick = st.selectbox("Product", ids, format_func=lambda i: PRODUCTS[i]["name"])
-        item = next(i for i in st.session_state.shelf if i["id"] == pick)
-        st.subheader("Test result")
-        for line in explain_result(pick, item["test"]):
-            st.markdown(line)
-        st.subheader("Toss-by date")
-        for line in explain_toss_by(pick, item["opened"]):
-            st.markdown(line)
+        if not ids:
+            st.info("Your shelf is empty. Add a product on the **Test a product** page first.")
+        else:
+            pick = st.selectbox("Product", ids, format_func=lambda i: PRODUCTS[i]["name"])
+            item = next(i for i in st.session_state.shelf if i["id"] == pick)
+            st.subheader("Test result")
+            for line in explain_result(pick, item["test"]):
+                st.markdown(line)
+            st.subheader("Toss-by date")
+            for line in explain_toss_by(pick, item["opened"]):
+                st.markdown(line)
     elif topic == "The FDA finding":
         for line in explain_fda():
             st.markdown(line)

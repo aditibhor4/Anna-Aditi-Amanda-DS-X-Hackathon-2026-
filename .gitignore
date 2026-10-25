@@ -10,3 +10,6 @@ env/
 
 # OS / editor
 .DS_Store
+
+# Teria runtime data (user's saved shelf)
+teria_shelf.json
